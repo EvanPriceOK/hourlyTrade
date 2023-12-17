@@ -13,6 +13,7 @@ import cbpro
 import time
 import pandas as pd
 import numpy as np
+import csv
 
 
 # api
@@ -27,36 +28,74 @@ pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 50)
 
 
-# get all available coinbase crypto names tied to account
-def getNames():
+# read from file list of valid cryptos
+# 229 as of 12/17/23
+def getInclude():
 	
-	wire.write("Available Cryptos:\n")
-	names = []
+	include = []	# to return
+	
+	with open("include.dat", mode = "r") as infile:
+		reader = csv.reader(infile)
+		for row in reader:	
+			include.append(row[0])
+			
+	wire.write(str(include) + "\n\n")
+	return include
+	
+	
+# read from file list of invalid cryptos
+# stable, dex, delisted, etc
+# 35 as of 12/17/23
+def getExclude():
+
+	exclude = []	# to return
+	
+	with open("exclude.dat", mode = "r") as infile:
+		for line in infile:
+			exclude.append(line.strip())
+			
+	wire.write(str(exclude) + "\n\n")
+	return exclude
+	
+
+# get all available coinbase crypto names tied to account
+# check for new cryptos
+def getNames(include, exclude):
+	
+	names = []	# to return
 	
 	try:
-		account = client.get_accounts(limit = 300)	# 264 coins as of 12/13/23
+		account = client.get_accounts(limit = 300)	# 264 as of 12/13/23
 		for wallet in account.data:
-			wire.write(str(wallet['balance']['currency']) + "\n")
-			names.append(wallet['balance']['currency'])
-	
+			# wire.write(str(wallet['name']) + "\n")
+			# wire.write(str(wallet) + "\n\n")
+			names.append(wallet['name'])
+			
+			if wallet['name'] not in include and wallet['name'] not in exclude:
+				wire.write("\n\n")
+				wire.write("################\n")
+				wire.write("#  NEW CRYPTO  #\n")
+				wire.write("################\n")
+				wire.write("\n" + str(wallet['name']) + "\n")
+				
+				
 	# cb client response error
 	except:
 		return 0		
 	
+	wire.write(str(names) + "\n\n")
 	return names
 
 
-# get public candle data from coinbase
-# and calculate volatility
-def getVolatility(nameInput):
+# get public candle data from coinbase and calculate volatility
+def getVolatility(include):
 	
-	wire.write("\nCandle Data:\n\n")
 	volDict = {}
 	
-	for name in nameInput:
+	for name in include:
 		try:
 			# 60 second granularity * 60 rows -> appx 5 hours
-			raw = cbp.get_product_historic_rates(product_id = name + "-USD", granularity = 60)
+			raw = cbp.get_product_historic_rates(product_id = name.replace(" Wallet", "-USD"), granularity = 60)
 			
 			# chronological order, then send to pandas
 			raw.reverse()
@@ -82,13 +121,12 @@ def getVolatility(nameInput):
 			wire.write(str(df) + "\n")
 			
 		except:
-			wire.write("\n" + name + "Invalid\n")	
+			wire.write("\n" + name + " Invalid\n")	
 	
 	# sort by volatility descending
 	volDict = sorted(volDict.items(), key = lambda x:x[1], reverse = True)
-	
+		
 	wire.write("\n\n" + str(volDict) + "\n")
-	print(str(volDict))
 
 
 
@@ -101,20 +139,20 @@ def getVolatility(nameInput):
 start_time = time.time()	# track runtime
 
 
-cryptoNames = getNames()	# all cb wallets
+include = getInclude()		# valid wallets
 
-# loop until no errors
-while cryptoNames == 0:
-	cryptoNames = getNames()
-	
-print(str(cryptoNames))		# console output
+exclude = getExclude()		# invalid wallets
 
-getVolatility(cryptoNames)	# calculate volatility based on public cb data
+cryptoNames = getNames(include, exclude)
+
+while cryptoNames == 0:		# loop until no errors
+	cryptoNames = getNames(include, exclude)
+
+getVolatility(include)		# calculate volatility
 
 
 end_time = time.time()
 print("--- %s seconds ---" % (end_time - start_time))
 print("--- %s minutes ---" % ((end_time - start_time) / 60))
 
-# close file output
-wire.close()
+wire.close()				# close file output
