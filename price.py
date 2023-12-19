@@ -10,6 +10,7 @@ collections.Callable = abc.Callable
 # imports
 from coinbase.wallet.client import Client
 import cbpro
+import coinmarketcapapi
 import time
 import pandas as pd
 import numpy as np
@@ -20,6 +21,7 @@ import csv
 handshake = open('api.dat', 'r').read().splitlines()
 client = Client(handshake[0], handshake[1])
 cbp = cbpro.PublicClient()
+cmc = coinmarketcapapi.CoinMarketCapAPI(handshake[2])
 
 
 # output
@@ -28,24 +30,43 @@ pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 50)
 
 
-# read from file list of valid cryptos
-# 229 as of 12/17/23
+# read from file list of valid cryptos -> 228 as of 12/19/23
 def getInclude():
 	
-	include = []	# to return
+	include = []	# list of names
+	cmcID = {}		# name : cmcID
+	idCMC = {}		# cmcID : name
+	build = []		# int list cmcID
+	strBuild = ""	# for cmc latest quote -> 1hr % change
 	
 	with open("include.dat", mode = "r") as infile:
 		reader = csv.reader(infile)
 		for row in reader:	
 			include.append(row[0])
+			cmcID[row[0]] = row[1]
+			idCMC[row[1]] = row[0]
+			build.append(int(row[1]))
 			
+	build.sort()	# ascending order
+	
+	for i in build:	# convert to one string
+		strBuild += str(i) + ","
+	strBuild = strBuild[:-1]
+	
 	wire.write(str(include) + "\n\n")
-	return include
+	wire.write(str(cmcID) + "\n\n")
+	wire.write(str(idCMC) + "\n\n")
+	wire.write(strBuild + "\n\n")
+	
+	yield include	# multiple return values
+	yield cmcID
+	yield idCMC
+	yield strBuild
 	
 	
 # read from file list of invalid cryptos
 # stable, dex, delisted, etc
-# 35 as of 12/17/23
+# 36 as of 12/19/23
 def getExclude():
 
 	exclude = []	# to return
@@ -59,10 +80,11 @@ def getExclude():
 	
 
 # get all available coinbase crypto names tied to account
-# check for new cryptos
+# get assetID and check for new crypto
 def getNames(include, exclude):
 	
 	names = []	# to return
+	astID = {}
 	
 	try:
 		account = client.get_accounts(limit = 300)	# 264 as of 12/13/23
@@ -71,6 +93,10 @@ def getNames(include, exclude):
 			# wire.write(str(wallet) + "\n\n")
 			names.append(wallet['name'])
 			
+			if wallet['name'] in include:
+				astID[wallet['name']] = wallet['currency']['asset_id']
+				build 
+			
 			if wallet['name'] not in include and wallet['name'] not in exclude:
 				wire.write("\n\n")
 				wire.write("################\n")
@@ -78,14 +104,16 @@ def getNames(include, exclude):
 				wire.write("################\n")
 				wire.write("\n" + str(wallet['name']) + "\n")
 				
-				
 	# cb client response error
 	except:
 		return 0		
 	
 	wire.write(str(names) + "\n\n")
-	return names
-
+	wire.write(str(astID) + "\n\n")
+	
+	yield names
+	yield astID
+	
 
 # get public candle data from coinbase and calculate volatility
 def getVolatility(include):
@@ -94,7 +122,8 @@ def getVolatility(include):
 	
 	for name in include:
 		try:
-			# 60 second granularity * 60 rows -> appx 5 hours
+			# 60 second granularity * 300 rows -> at least 5 hours
+			# reporting based on volume so could be a couple days
 			raw = cbp.get_product_historic_rates(product_id = name.replace(" Wallet", "-USD"), granularity = 60)
 			
 			# chronological order, then send to pandas
@@ -117,14 +146,15 @@ def getVolatility(include):
 			vol = round(vol, 2)
 			volDict[name] = vol
 			
-			wire.write("\n" + name + " " + str(vol) + "\n")
-			wire.write(str(df) + "\n")
+			wire.write(name + " " + str(vol) + "\n")
+			# wire.write(str(df) + "\n")
 			
 		except:
 			wire.write("\n" + name + " Invalid\n")	
 	
 	# sort by volatility descending
-	volDict = sorted(volDict.items(), key = lambda x:x[1], reverse = True)
+	# only the top 22 most volatile cryptos
+	volDict = sorted(volDict.items(), key = lambda x:x[1], reverse = True)[:22]
 		
 	wire.write("\n\n" + str(volDict) + "\n")
 
@@ -136,19 +166,26 @@ def getVolatility(include):
 ##############
 
 
-start_time = time.time()	# track runtime
+start_time = time.time()		# track runtime
 
 
-include = getInclude()		# valid wallets
+includeResult = getInclude()	# all valid wallets
+include = next(includeResult)	# list of valid crypto names
+cmcID = next(includeResult)		# name : cmcID
+idCMC = next(includeResult)		# cmcID : name
+build = next(includeResult)		# list 
 
-exclude = getExclude()		# invalid wallets
+exclude = getExclude()			# invalid wallets
 
 cryptoNames = getNames(include, exclude)
 
-while cryptoNames == 0:		# loop until no errors
+while cryptoNames == 0:			# loop until no errors
 	cryptoNames = getNames(include, exclude)
+	
+names = next(cryptoNames)		# list of all crypto names
+astID = next(cryptoNames)		# name : assetID
 
-getVolatility(include)		# calculate volatility
+getVolatility(include)			# calculate volatility
 
 
 end_time = time.time()
