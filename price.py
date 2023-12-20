@@ -36,8 +36,8 @@ def getInclude():
 	include = []	# list of names
 	cmcID = {}		# name : cmcID
 	idCMC = {}		# cmcID : name
-	build = []		# int list cmcID
-	strBuild = ""	# for cmc latest quote -> 1hr % change
+	builder = []	# int list cmcID
+	build = ""		# for cmc latest quote -> 1hr % change
 	
 	with open("include.dat", mode = "r") as infile:
 		reader = csv.reader(infile)
@@ -45,23 +45,21 @@ def getInclude():
 			include.append(row[0])
 			cmcID[row[0]] = row[1]
 			idCMC[row[1]] = row[0]
-			build.append(int(row[1]))
-			
-	build.sort()	# ascending order
+			builder.append(int(row[1]))
 	
-	for i in build:	# convert to one string
-		strBuild += str(i) + ","
-	strBuild = strBuild[:-1]
+	for i in builder:	# convert to one string
+		build += str(i) + ","
+	build = build[:-1]	# remove last comma
 	
-	wire.write(str(include) + "\n\n")
-	wire.write(str(cmcID) + "\n\n")
-	wire.write(str(idCMC) + "\n\n")
-	wire.write(strBuild + "\n\n")
+	# wire.write(str(include) + "\n\n")
+	# wire.write(str(cmcID) + "\n\n")
+	# wire.write(str(idCMC) + "\n\n")
+	# wire.write(build + "\n\n")
 	
 	yield include	# multiple return values
 	yield cmcID
 	yield idCMC
-	yield strBuild
+	yield build
 	
 	
 # read from file list of invalid cryptos
@@ -75,7 +73,8 @@ def getExclude():
 		for line in infile:
 			exclude.append(line.strip())
 			
-	wire.write(str(exclude) + "\n\n")
+	# wire.write(str(exclude) + "\n\n")
+	
 	return exclude
 	
 
@@ -108,8 +107,8 @@ def getNames(include, exclude):
 	except:
 		return 0		
 	
-	wire.write(str(names) + "\n\n")
-	wire.write(str(astID) + "\n\n")
+	# wire.write(str(names) + "\n\n")
+	# wire.write(str(astID) + "\n\n")
 	
 	yield names
 	yield astID
@@ -119,6 +118,7 @@ def getNames(include, exclude):
 def getVolatility(include):
 	
 	volDict = {}
+	volOut = []
 	
 	for name in include:
 		try:
@@ -146,19 +146,40 @@ def getVolatility(include):
 			vol = round(vol, 2)
 			volDict[name] = vol
 			
-			wire.write(name + " " + str(vol) + "\n")
-			# wire.write(str(df) + "\n")
+			volOut.append(name + " " + str(vol))
 			
 		except:
-			wire.write("\n" + name + " Invalid\n")	
+			wire.write("\n\n" + name + " Invalid\n\n")	
 	
 	# sort by volatility descending
 	# only the top 22 most volatile cryptos
 	volDict = sorted(volDict.items(), key = lambda x:x[1], reverse = True)[:22]
-		
-	wire.write("\n\n" + str(volDict) + "\n")
+	
+	wire.write(str(volOut) + "\n\n")	
+	wire.write(str(volDict) + "\n\n")
+
+	return volDict
 
 
+# latest quotes from cmc to get 1hr % change
+def getLatestQuotes(build, idCMC):
+	
+	oneHr = {}
+	
+	quote = cmc.cryptocurrency_quotes_latest(id=build, convert='USD')
+	df = pd.DataFrame.from_records(quote.data)
+	
+	df = df.iloc[19]	# price data
+
+	for name, value in df.items():
+		value['USD']['name'] = idCMC[name]
+		oneHr[idCMC[name]] = value['USD']['percent_change_1h']
+		wire.write(str(value['USD']) + "\n\n")
+	
+	oneHr = sorted(oneHr.items(), key = lambda x:x[1], reverse = True)
+	wire.write(str(oneHr) + "\n\n")
+	
+	return oneHr
 
 
 ##############
@@ -166,30 +187,32 @@ def getVolatility(include):
 ##############
 
 
-start_time = time.time()		# track runtime
+start_time = time.time()				# track runtime
 
 
-includeResult = getInclude()	# all valid wallets
-include = next(includeResult)	# list of valid crypto names
-cmcID = next(includeResult)		# name : cmcID
-idCMC = next(includeResult)		# cmcID : name
-build = next(includeResult)		# list 
+includeResult = getInclude()			# all valid wallets
+include = next(includeResult)			# list of valid crypto names
+cmcID = next(includeResult)				# name : cmcID
+idCMC = next(includeResult)				# cmcID : name
+build = next(includeResult)				# list 
 
-exclude = getExclude()			# invalid wallets
+exclude = getExclude()					# invalid wallets
 
 cryptoNames = getNames(include, exclude)
 
-while cryptoNames == 0:			# loop until no errors
+while cryptoNames == 0:					# loop until no errors
 	cryptoNames = getNames(include, exclude)
 	
-names = next(cryptoNames)		# list of all crypto names
-astID = next(cryptoNames)		# name : assetID
+names = next(cryptoNames)				# list of all crypto names
+astID = next(cryptoNames)				# name : assetID
 
-getVolatility(include)			# calculate volatility
+volDict = getVolatility(include)		# calculate volatility
+
+oneHr = getLatestQuotes(build, idCMC)	# percentage change 1 hr
 
 
 end_time = time.time()
 print("--- %s seconds ---" % (end_time - start_time))
 print("--- %s minutes ---" % ((end_time - start_time) / 60))
 
-wire.close()				# close file output
+wire.close()							# close file output
