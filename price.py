@@ -12,10 +12,15 @@ import cbpro
 import coinmarketcapapi
 import time
 import pandas as pd
+import polars as pl
 import numpy as np
+import talib
 import csv
+import re
 
 count = 0	# track number of trades
+pd.set_option('display.max_rows', 500)	# pandas output config
+pd.set_option('display.max_columns', 50)
 
 
 class trade:
@@ -43,23 +48,23 @@ class trade:
 		global count
 		count += 1
 		
-		# file output and pandas output config
+		# file output
 		wireName = "wire" + str(count) + ".dat"
 		wire = open(wireName, "w")
-		pd.set_option('display.max_rows', 500)    
-		pd.set_option('display.max_columns', 50)
 		
-		self.readFromFile(wire)
+		# self.readFromFile(wire)
 		
-		allCryptos = self.checkForNew(wire)
+		# allCryptos = self.checkForNew(wire)
 
 		# loop until no errors
-		while allCryptos == 0:
-			allCryptos = self.checkForNew(wire)
+		# while allCryptos == 0:
+			# allCryptos = self.checkForNew(wire)
 
-		self.getVolatility(wire)
+		# self.getVolatility(wire)
 		
-		self.getLatestQuotes(wire)
+		# self.getLatestQuotes(wire)
+		
+		self.getHistorical(wire, 52)	# test with xrp
 		
 		wire.close()	# close file output
 
@@ -108,8 +113,8 @@ class trade:
 				if wallet['name'] not in self.include and wallet['name'] not in self.exclude:
 					wire.write("################\n")
 					wire.write("#  NEW CRYPTO  #\n")
-					wire.write("################\n")
-					wire.write("\n" + str(wallet['name']) + "\n")
+					wire.write("################\n\n")
+					wire.write(str(wallet['name']) + "\n\n")
 
 		# cb client response error
 		except:
@@ -187,6 +192,81 @@ class trade:
 		# output
 		wire.write("One Hour Percentage Change ->\n")
 		wire.write(str(self.oneHour) + "\n\n")
+		
+		
+	def getHistorical(self, wire, num):
+		
+		response = self.cmc.cryptocurrency_quotes_historical(id=str(num), count = 60, convert='USD')
+
+		response = str(response)
+		response = response.replace(response[:31], "")
+		response = response[:-1]
+		response = response.replace("[","")
+		response = response.replace("]","")
+
+		while response[-1] != "}":
+			response = response[:-1]
+
+		lines = re.split("\}\}\}", response)    # make list
+		lines.pop()
+
+		dfList = []
+		dictList = []
+
+		for i in lines:
+			i = i.replace(", {", "").replace("{", "")
+			i = i.replace(i[:57], "")
+			dfList.append(i)
+
+			res = []
+			for sub in i.split(', '):
+				if ':' in sub:
+					res.append(map(str.strip, sub.split(':', 1)))
+			res = dict(res)
+			dictList.append(res)
+
+		df = pd.DataFrame(dictList)
+		
+		# remove columns with static values
+		df.drop(['\'total_supply\'', '\'circulating_supply\''], axis = 1, inplace = True)
+		
+		wire.write(str(df) + "\n\n")
+		
+		# send to polars for multithreading
+		polarsDF = pl.DataFrame(df, schema=['percent_change_1h', 'percent_change_24h', 'percent_change_7d', 'percent_change_30d', 'price', 'volume_24h', 'market_cap', 'timestamp'])
+		
+		# technical analysis indicators
+		rsi = pl.Series(talib.RSI(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="rsi", values=rsi))
+		
+		upperband, middleband, lowerband = pl.Series(talib.BBANDS(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name = "upperband", values = upperband))
+		polarsDF = polarsDF.with_columns(pl.Series(name = "middleband", values = middleband))
+		polarsDF = polarsDF.with_columns(pl.Series(name = "lowerband", values = lowerband))
+		
+		fastk, fastd = pl.Series(talib.STOCHRSI(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="fastk", values = fastk))
+		polarsDF = polarsDF.with_columns(pl.Series(name="fastd", values = fastd))
+				
+		ema = pl.Series(talib.EMA(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="ema", values = ema))
+		
+		obv = pl.Series(talib.OBV(polarsDF["price"], polarsDF["market_cap"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="obv", values = obv))
+		
+		std = pl.Series(talib.STDDEV(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="std", values = std))
+		
+		macd, macdsignal, macdhist = pl.Series(talib.MACD(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="macd", values = macd))
+		polarsDF = polarsDF.with_columns(pl.Series(name="macdsignal", values = macdsignal))
+		polarsDF = polarsDF.with_columns(pl.Series(name="macdhist", values = macdhist))
+
+		# back to pandas
+		df = polarsDF.to_pandas()
+		
+		# output
+		wire.write(str(df) + "\n\n")
 
 
 ##############
