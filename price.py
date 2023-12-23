@@ -10,16 +10,24 @@ collections.Callable = abc.Callable
 from coinbase.wallet.client import Client
 import cbpro
 import coinmarketcapapi
-import time
 import pandas as pd
 import polars as pl
 import numpy as np
 import talib
+from prophet import Prophet
+import time
+from datetime import datetime, timedelta
 import csv
 import re
+import logging
+import schedule
+
+logging.getLogger("prophet").disabled = True
+logging.getLogger("cmdstanpy").disabled = True
 
 count = 0	# track number of trades
-pd.set_option('display.max_rows', 500)	# pandas output config
+
+pd.set_option('display.max_rows', 500)		# pandas output config
 pd.set_option('display.max_columns', 50)
 
 
@@ -39,6 +47,7 @@ class trade:
 	assetID = {}	# name : cbAssetID
 	volDict = {}	# name : volatility
 	oneHour = {}	# name : 1 hr % change
+	pred1hr = {}	# name : predicted 1hr % change
 	
 	idString = ""	# cmcID, cmcID, ...
 	
@@ -48,25 +57,39 @@ class trade:
 		global count
 		count += 1
 		
+		start_time = time.time()	# track runtime
+		print(count)
+		
 		# file output
 		wireName = "wire" + str(count) + ".dat"
 		wire = open(wireName, "w")
 		
-		# self.readFromFile(wire)
+		self.readFromFile(wire)
 		
-		# allCryptos = self.checkForNew(wire)
+		allCryptos = self.checkForNew(wire)
 
 		# loop until no errors
-		# while allCryptos == 0:
-			# allCryptos = self.checkForNew(wire)
+		while allCryptos == 0:
+			allCryptos = self.checkForNew(wire)
 
-		# self.getVolatility(wire)
+		self.getLatestQuotes(wire)
 		
-		# self.getLatestQuotes(wire)
+		vList = self.getVolatility(wire)
 		
-		self.getHistorical(wire, 52)	# test with xrp
+		for name in vList:
+		
+			df = self.getHistorical(wire, self.cmcID[name])
+		
+			self.predict(wire, df, name)
+			
+		self.pred1hr = sorted(self.pred1hr.items(), key = lambda x:x[1], reverse = True)[:1]
+		wire.write("\nFinal Prediction -> " + str(self.pred1hr) + "\n")
 		
 		wire.close()	# close file output
+		
+		end_time = time.time()
+		print("--- %s seconds ---" % (end_time - start_time))
+		print("--- %s minutes ---" % ((end_time - start_time) / 60))
 
 	
 	def readFromFile(self, wire):
@@ -88,16 +111,16 @@ class trade:
 				self.exclude.append(line.strip())
 
 		# output
-		wire.write("Available Cryptos ->\n")
-		wire.write(str(self.include) + "\n\n")
-		wire.write("Name : Coinmarketcap ID ->\n")
-		wire.write(str(self.cmcID) + "\n\n")
-		wire.write("Coinmarketcap ID : Name ->\n")
-		wire.write(str(self.idCMC) + "\n\n")
-		wire.write("Coinmarketcap IDs ->\n")
-		wire.write(str(self.idString) + "\n\n")
-		wire.write("Unavailable Cryptos ->\n")
-		wire.write(str(self.exclude) + "\n\n")
+		# wire.write("Available Cryptos ->\n")
+		# wire.write(str(self.include) + "\n\n")
+		# wire.write("Name : Coinmarketcap ID ->\n")
+		# wire.write(str(self.cmcID) + "\n\n")
+		# wire.write("Coinmarketcap ID : Name ->\n")
+		# wire.write(str(self.idCMC) + "\n\n")
+		# wire.write("Coinmarketcap IDs ->\n")
+		# wire.write(str(self.idString) + "\n\n")
+		# wire.write("Unavailable Cryptos ->\n")
+		# wire.write(str(self.exclude) + "\n\n")
 	
 	
 	def checkForNew(self, wire):
@@ -121,10 +144,28 @@ class trade:
 			return 0
 		
 		# output
-		wire.write("Name : Coinbase Asset ID ->\n")
-		wire.write(str(self.assetID) + "\n\n")
+		# wire.write("Name : Coinbase Asset ID ->\n")
+		# wire.write(str(self.assetID) + "\n\n")
 		
 		return 1	
+
+
+	def getLatestQuotes(self, wire):
+
+		quote = self.cmc.cryptocurrency_quotes_latest(id=self.idString, convert='USD')
+		df = pd.DataFrame.from_records(quote.data)
+
+		df = df.iloc[19]	# price data
+
+		for name, value in df.items():
+			value['USD']['name'] = self.idCMC[name]
+			self.oneHour[self.idCMC[name]] = value['USD']['percent_change_1h']
+
+		self.oneHour = sorted(self.oneHour.items(), key = lambda x:x[1], reverse = True)
+
+		# output
+		wire.write("One Hour Percentage Change ->\n")
+		wire.write(str(self.oneHour) + "\n\n")
 
 
 	def getVolatility(self, wire):
@@ -159,8 +200,8 @@ class trade:
 
 				volOut.append(name + " " + str(vol))
 				
-				wire.write(name + "\n")
-				wire.write(str(df) + "\n\n")
+				# wire.write(name + "\n")
+				# wire.write(str(df) + "\n\n")
 
 			except:
 				wire.write(name + " Invalid\n\n")	
@@ -168,35 +209,23 @@ class trade:
 		# sort by volatility descending
 		# only the top 22 most volatile cryptos
 		self.volDict = sorted(self.volDict.items(), key = lambda x:x[1], reverse = True)[:22]
-
+		
 		# output
-		wire.write("Volatility ->\n")
-		wire.write(str(volOut) + "\n\n")	
+		# wire.write("Volatility ->\n")
+		# wire.write(str(volOut) + "\n\n")	
 		wire.write("Top 22 Most Volatile Cryptos ->\n")
 		wire.write(str(self.volDict) + "\n\n")
-
-
-	def getLatestQuotes(self, wire):
-
-		quote = self.cmc.cryptocurrency_quotes_latest(id=self.idString, convert='USD')
-		df = pd.DataFrame.from_records(quote.data)
-
-		df = df.iloc[19]	# price data
-
-		for name, value in df.items():
-			value['USD']['name'] = self.idCMC[name]
-			self.oneHour[self.idCMC[name]] = value['USD']['percent_change_1h']
-
-		self.oneHour = sorted(self.oneHour.items(), key = lambda x:x[1], reverse = True)
-
-		# output
-		wire.write("One Hour Percentage Change ->\n")
-		wire.write(str(self.oneHour) + "\n\n")
+		
+		# return list of keys
+		vList = []
+		for key, value in self.volDict:
+			vList.append(key)
+		return vList
 		
 		
 	def getHistorical(self, wire, num):
 		
-		response = self.cmc.cryptocurrency_quotes_historical(id=str(num), count = 60, convert='USD')
+		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 288, convert='USD')
 
 		response = str(response)
 		response = response.replace(response[:31], "")
@@ -230,8 +259,6 @@ class trade:
 		# remove columns with static values
 		df.drop(['\'total_supply\'', '\'circulating_supply\''], axis = 1, inplace = True)
 		
-		wire.write(str(df) + "\n\n")
-		
 		# send to polars for multithreading
 		polarsDF = pl.DataFrame(df, schema=['percent_change_1h', 'percent_change_24h', 'percent_change_7d', 'percent_change_30d', 'price', 'volume_24h', 'market_cap', 'timestamp'])
 		
@@ -251,6 +278,9 @@ class trade:
 		ema = pl.Series(talib.EMA(polarsDF["price"]))
 		polarsDF = polarsDF.with_columns(pl.Series(name="ema", values = ema))
 		
+		sma = pl.Series(talib.SMA(polarsDF["price"]))
+		polarsDF = polarsDF.with_columns(pl.Series(name="sma", values = sma))
+		
 		obv = pl.Series(talib.OBV(polarsDF["price"], polarsDF["market_cap"]))
 		polarsDF = polarsDF.with_columns(pl.Series(name="obv", values = obv))
 		
@@ -262,21 +292,70 @@ class trade:
 		polarsDF = polarsDF.with_columns(pl.Series(name="macdsignal", values = macdsignal))
 		polarsDF = polarsDF.with_columns(pl.Series(name="macdhist", values = macdhist))
 
-		# back to pandas
-		df = polarsDF.to_pandas()
+		# rename for prophet
+		polarsDF = polarsDF.rename({"timestamp" : "ds"})
+		polarsDF = polarsDF.rename({"price" : "y"})
+
+		# back to pandas and remove nan values
+		df = polarsDF.to_pandas().dropna()
+		
+		# change to datetime
+		df["ds"] = pd.to_datetime(df["ds"])
 		
 		# output
-		wire.write(str(df) + "\n\n")
+		# wire.write(str(df) + "\n\n")
+
+		return df
+		
+		
+	def predict(self, wire, df, name):
+
+		# last timestamp
+		last_observed_time = df['ds'].max()
+
+		# one hour from the last timestamp
+		future_time = last_observed_time + timedelta(hours=1)
+
+		# create dataframe with the future timestamp
+		future_date = pd.DataFrame({'ds': [future_time]})
+
+		features = ["percent_change_1h", "volume_24h", "rsi", "upperband", "middleband", "lowerband", "fastk", "fastd", "ema", "sma", "obv", "std", "macd", "macdsignal", "macdhist"]
+
+		# fill in the regressor values for the future timestamp
+		for f in features:
+			future_date[f] = df[f].iloc[-1]
+
+		# modeling
+		model = Prophet(yearly_seasonality = False, weekly_seasonality = False, daily_seasonality = False)
+		model.add_seasonality(name = "hourly", period = (1/24), fourier_order = 10)
+		
+		for f in features:
+			model.add_regressor(f)
+
+		model.fit(df[["ds", "y"] + features])
+		forecast = model.predict(future_date)
+
+		percentPredict = (( float(forecast['yhat'].iloc[0]) - float(df['y'].iloc[-1]) ) / float(df['y'].iloc[-1]) ) * 100
+		# percentPredict = round(percentPredict, 2)
+		
+		wire.write(name + " " + str(percentPredict) + "\n")
+		
+		self.pred1hr[name] = percentPredict
+		
+
+def run():
+	_new = trade()
 
 
 ##############
 ###  MAIN  ###
 ##############
 
-start_time = time.time()	# track runtime
 
-_new = trade()
+# SCHEDULE
+schedule.every().hour.at("22:22").do(run)
 
-end_time = time.time()
-print("--- %s seconds ---" % (end_time - start_time))
-print("--- %s minutes ---" % ((end_time - start_time) / 60))
+# keep running 
+while True:
+	schedule.run_pending()
+	time.sleep(1) # pause one second
