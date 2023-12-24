@@ -15,6 +15,7 @@ import polars as pl
 import numpy as np
 import talib
 from prophet import Prophet
+from sklearn.ensemble import RandomForestRegressor
 import time
 from datetime import datetime, timedelta
 import csv
@@ -22,7 +23,7 @@ import re
 import logging
 import schedule
 
-logging.getLogger("prophet").disabled = True
+logging.getLogger("prophet").disabled = True	# no prophet output
 logging.getLogger("cmdstanpy").disabled = True
 
 count = 0	# track number of trades
@@ -184,36 +185,36 @@ class trade:
 
 				# convert date from unix timestamp to readable format
 				df['Date'] = pd.to_datetime(df['Date'], unit='s')
-
-				# insert log return
-				df.insert(6, "Log Return", np.log(df['Close']/df['Close'].shift()))
-
-				# calculate the time difference between consecutive data points
-				time_diff = df['Date'].diff().mean()
-
-				# calculate volatility with a dynamic annualization factor 
-				# based on the average time difference
-				annualization_factor = 24 / time_diff.total_seconds()	# 24 hours in a day
-				vol = (df['Log Return'].std() * (annualization_factor) ** 0.5) * 100
-				vol = round(vol, 2)
-				self.volDict[name] = vol
-
-				volOut.append(name + " " + str(vol))
 				
+				# average true range volatility
+				time_diff = df['Date'].diff().dt.total_seconds()
+				high_low = df['High'] - df['Low']
+				high_close_prev = abs(df['High'] - df['Close'].shift(1))
+				low_close_prev = abs(df['Low'] - df['Close'].shift(1))
+				true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+				atr = true_range / time_diff
+				atr = true_range.mean() * 100  # Multiply by 100 for percentage
+				atr = round(atr, 2)
+								
+				# add to dict
+				self.volDict[name] = atr
+
+				# output
+				volOut.append(name + " " + str(atr))
 				# wire.write(name + "\n")
 				# wire.write(str(df) + "\n\n")
 
-			except:
-				wire.write(name + " Invalid\n\n")	
+			except Exception as e:
+				wire.write(str(e) + "\n\n")	
 
 		# sort by volatility descending
-		# only the top 22 most volatile cryptos
-		self.volDict = sorted(self.volDict.items(), key = lambda x:x[1], reverse = True)[:22]
+		# only the top 29 most volatile cryptos
+		self.volDict = sorted(self.volDict.items(), key = lambda x:x[1], reverse = True)[:29]
 		
 		# output
 		# wire.write("Volatility ->\n")
 		# wire.write(str(volOut) + "\n\n")	
-		wire.write("Top 22 Most Volatile Cryptos ->\n")
+		wire.write("Top 29 Most Volatile Cryptos ->\n")
 		wire.write(str(self.volDict) + "\n\n")
 		
 		# return list of keys
@@ -225,7 +226,7 @@ class trade:
 		
 	def getHistorical(self, wire, num):
 		
-		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 288, convert='USD')
+		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 120, convert='USD')
 
 		response = str(response)
 		response = response.replace(response[:31], "")
@@ -294,7 +295,7 @@ class trade:
 
 		# rename for prophet
 		polarsDF = polarsDF.rename({"timestamp" : "ds"})
-		polarsDF = polarsDF.rename({"price" : "y"})
+		polarsDF = polarsDF.rename({"percent_change_1h" : "y"})
 
 		# back to pandas and remove nan values
 		df = polarsDF.to_pandas().dropna()
@@ -314,18 +315,25 @@ class trade:
 		last_observed_time = df['ds'].max()
 
 		# one hour from the last timestamp
-		future_time = last_observed_time + timedelta(hours=1)
+		future_time = last_observed_time + timedelta(hours = 1)
 
 		# create dataframe with the future timestamp
 		future_date = pd.DataFrame({'ds': [future_time]})
 
-		features = ["percent_change_1h", "volume_24h", "rsi", "upperband", "middleband", "lowerband", "fastk", "fastd", "ema", "sma", "obv", "std", "macd", "macdsignal", "macdhist"]
+		features = ["rsi", "fastk", "fastd", "ema", "obv", "std", "macd", "macdsignal", "macdhist", "price", "volume_24h"]
 
 		# fill in the regressor values for the future timestamp
 		for f in features:
 			future_date[f] = df[f].iloc[-1]
+		
+		# rf
+		xtrain = df[features]
+		ytrain = df["y"]
+		rf_model = RandomForestRegressor()
+		rf_model.fit(xtrain, ytrain)
+		rf_predictions = rf_model.predict(future_date[features])
 
-		# modeling
+		# prophet
 		model = Prophet(yearly_seasonality = False, weekly_seasonality = False, daily_seasonality = False)
 		model.add_seasonality(name = "hourly", period = (1/24), fourier_order = 10)
 		
@@ -334,13 +342,15 @@ class trade:
 
 		model.fit(df[["ds", "y"] + features])
 		forecast = model.predict(future_date)
-
-		percentPredict = (( float(forecast['yhat'].iloc[0]) - float(df['y'].iloc[-1]) ) / float(df['y'].iloc[-1]) ) * 100
-		# percentPredict = round(percentPredict, 2)
+		pr_predictions = float(forecast['yhat'].iloc[0])
 		
-		wire.write(name + " " + str(percentPredict) + "\n")
+		# combine
+		combined_predictions = (rf_predictions[-1] + pr_predictions) / 2
 		
-		self.pred1hr[name] = percentPredict
+		# output
+		wire.write(name + " " + str(combined_predictions) + "\n")
+		
+		self.pred1hr[name] = combined_predictions
 		
 
 def run():
@@ -353,7 +363,7 @@ def run():
 
 
 # SCHEDULE
-schedule.every().hour.at("22:22").do(run)
+schedule.every().hour.at("17:11").do(run)
 
 # keep running 
 while True:
