@@ -15,7 +15,6 @@ import polars as pl
 import numpy as np
 import talib
 from ta.volatility import average_true_range
-from sklearn.preprocessing import MinMaxScaler
 from prophet import Prophet
 from pmdarima import auto_arima
 import time
@@ -29,7 +28,7 @@ logging.getLogger("prophet").disabled = True
 logging.getLogger("cmdstanpy").disabled = True
 
 # pandas output config
-pd.set_option('display.max_rows', 80)
+pd.set_option('display.max_rows', 25)
 pd.set_option('display.max_columns', 25)
 
 
@@ -41,63 +40,78 @@ class trade:
 	cbp = cbpro.PublicClient()
 	cmc = coinmarketcapapi.CoinMarketCapAPI(handshake[2])
 	
+	# set up output
+	now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+	wireName = "/home/evan/Documents/hourlyTrade/dat/" + str(now) + ".dat"
+	wire = open(wireName, "w")
+	wire.write("####################\n")
+	wire.write("##  BEGIN SCRIPT  ##\n")
+	wire.write("####################\n\n")
+	wire.close()
+	
+	
 	# class variables
-	# filter cryptos
 	include = []
 	exclude = []
-	
 	cmcID   = {}	# name : cmcID and reverse
 	idCMC   = {}
 	assetID = {}	# name : cbAssetID
-	cmPrice = {}	# name : cmcPrice
-	cbPrice = {}	# name : cbPrice
 	volDict = {}	# name : volatility
-	oneHour = {}	# name : 1 hr % change (previous hour)
 	pred1hr = {}	# name : predicted 1hr % change
-	
-	idString = ""	# cmcID, cmcID, ...
 	
 	
 	# everything is run from the initializer
-	# schedule with cron instead
+	# schedule fifteen minute trade intervals with cron
 	def __init__(self):
 						
 		start_time = time.time()	# track runtime
 		
-		# file output
-		now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-		wireName = str(now) + ".dat"
-		wire = open("/home/evan/Documents/hourlyTrade/dat/" + wireName, "w")
+		self.output("Initializer\n\n")
 		
-		self.readFromFile(wire)
+		self.readFromFile()
 		
-		allCryptos = self.checkForNew(wire)
+		allCryptos = self.checkForNew()
 
 		# loop until no errors
 		while allCryptos == 0:
-			allCryptos = self.checkForNew(wire)
-
-		self.getLatestQuotes(wire)
+			allCryptos = self.checkForNew()
 		
-		vList = self.getVolatility(wire)
+		vList = self.getVolatility()
 		
 		for name in vList:
 		
-			df = self.getHistorical(wire, self.cmcID[name])
+			df = self.getHistorical(self.cmcID[name])
 		
-			self.predict(wire, df, name)
+			self.predict(df, name)
 		
 		self.pred1hr = sorted(self.pred1hr.items(), key = lambda x:x[1], reverse = True)[:1]
-		wire.write("\nCombined Final Prediction -> " + str(self.pred1hr) + "\n")
-		
-		wire.close()	# close file output
+		self.output("\nCombined Final Prediction -> " + str(self.pred1hr) + "\n\n")
 		
 		end_time = time.time()
-		#print("--- %s seconds ---" % (end_time - start_time))
-		#print("--- %s minutes ---" % ((end_time - start_time) / 60))
-
+		
+		self.output("Runtime ->\n")
+		self.output(str(end_time - start_time) + " seconds\n")
+		self.output(str((end_time - start_time) / 60) + " minutes\n\n")
+		
+		keyList = []
+		for key, value in self.pred1hr:
+			keyList.append(key)
+			self.output(str(key) + "\n")
+		
+		self.output(str(keyList) + "\n\n")
+		
+		self.trackMovement(keyList[0])
+		
 	
-	def readFromFile(self, wire):
+	# streamline output file
+	def output(self, message):
+		self.wire = open(self.wireName, "a")
+		self.wire.write(message)
+		self.wire.close()
+		
+	
+	# input files
+	def readFromFile(self):
 
 		# available cryptos
 		with open("/home/evan/Documents/hourlyTrade/include.dat", mode = "r") as infile:
@@ -106,28 +120,38 @@ class trade:
 				self.include.append(row[0])
 				self.cmcID[row[0]] = row[1]
 				self.idCMC[row[1]] = row[0]
-				self.idString += (str(row[1]) + ",")
-			
-			self.idString = self.idString[:-1]	# remove last ','
 		
 		# unavailable cryptos
 		with open("/home/evan/Documents/hourlyTrade/exclude.dat", mode = "r") as infile:
 			for line in infile:
 				self.exclude.append(line.strip())
 
-		# wire.write("Available Cryptos ->\n")
-		# wire.write(str(self.include) + "\n\n")
-		# wire.write("Name : Coinmarketcap ID ->\n")
-		# wire.write(str(self.cmcID) + "\n\n")
-		# wire.write("Coinmarketcap ID : Name ->\n")
-		# wire.write(str(self.idCMC) + "\n\n")
-		# wire.write("Coinmarketcap IDs ->\n")
-		# wire.write(str(self.idString) + "\n\n")
-		# wire.write("Unavailable Cryptos ->\n")
-		# wire.write(str(self.exclude) + "\n\n")
+		
+	# need to automate this every time script is run
+	# manual process right now
+	def checkForDelisted(self):
+		
+		account = self.client.get_accounts(limit = 300)
+		for wallet in account.data:
+			
+			try:
+				
+				# fix name for coinbase product ticker
+				name = str(wallet['name'])
+				name = name.replace(" Wallet", "-USD")
+				
+				# the output will specify if the wallet is delisted
+				quote = self.cbp.get_product_ticker(product_id = name)
+				self.output(str(wallet['name']) + "\n" + str(quote) + "\n\n")
+		
+			except Exception as e:
+				
+				self.output(str(e) + "\n\n")
 	
 	
-	def checkForNew(self, wire):
+	# loop all wallets and look for ones not 
+	# listed on include or exclude file
+	def checkForNew(self):
 		
 		# sometimes get_accounts will error out
 		try:
@@ -138,42 +162,22 @@ class trade:
 					self.assetID[wallet['name']] = wallet['currency']['asset_id']
 					
 				if wallet['name'] not in self.include and wallet['name'] not in self.exclude:
-					wire.write("################\n")
-					wire.write("#  NEW CRYPTO  #\n")
-					wire.write("################\n\n")
-					wire.write(str(wallet['name']) + "\n\n")
+					self.output("##################\n")
+					self.output("##  NEW CRYPTO  ##\n")
+					self.output("##################\n\n")
+					self.output(str(wallet['name']) + "\n\n")
 
 		# cb client response error
 		except:
 			return 0
 		
-		# wire.write("Name : Coinbase Asset ID ->\n")
-		# wire.write(str(self.assetID) + "\n\n")
-		
+		# success
 		return 1	
 
-
-	def getLatestQuotes(self, wire):
-
-		quote = self.cmc.cryptocurrency_quotes_latest(id=self.idString, convert='USD')
-		df = pd.DataFrame.from_records(quote.data)
-
-		df = df.iloc[19]	# price data
-		
-		for name, value in df.items():
-			value['USD']['name'] = self.idCMC[name]
-			self.oneHour[self.idCMC[name]] = value['USD']['percent_change_1h']
-			self.cmPrice[self.idCMC[name]] = value['USD']['price']
-
-		self.oneHour = sorted(self.oneHour.items(), key = lambda x:x[1], reverse = True)
-
-		wire.write("One Hour Percentage Change ->\n")
-		wire.write(str(self.oneHour) + "\n\n")
-		# wire.write("Coinmarketcap Latest Price ->\n")
-		# wire.write(str(self.cmPrice) + "\n\n")
-
-
-	def getVolatility(self, wire):
+	
+	# choose which cryptos go to modeling
+	# looking for volatile ones on an upswing
+	def getVolatility(self):
 		
 		for name in self.include:
 			try:
@@ -185,34 +189,48 @@ class trade:
 				raw.reverse()
 				df = pd.DataFrame(raw, columns = ["Date", "Open", "High", "Low", "Close", "Volume"]) 			
 				
-				# assuming four figure (and plus) cryptos won't move much in an hour
-				if df['Close'].iloc[-1] < 1000.00:
-					# convert date from unix timestamp to readable format
-					df['Date'] = pd.to_datetime(df['Date'], unit='s')
+				# convert date from unix timestamp to readable format
+				df['Date'] = pd.to_datetime(df['Date'], unit='s')
 
-					# average true range volatility
-					time_diff = df['Date'].diff().dt.total_seconds()
-					high_low = df['High'] - df['Low']
-					high_close_prev = abs(df['High'] - df['Close'].shift(1))
-					low_close_prev = abs(df['Low'] - df['Close'].shift(1))
-					true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
-					atr = true_range / time_diff
-					atr = true_range.mean() * 100	# multiply by 100 for percentage
-					atr = round(atr, 2)
-
-					# add to dict
-					self.volDict[name] = atr				
-					# wire.write(str(df) + "\n\n")
+				# focus on very recent data
+				df = df.tail(16)
 				
-			except Exception as e:
-				wire.write(str(e) + "\n\n")	
+				# average true range volatility
+				df['ATR'] = average_true_range(df['High'], df['Low'], df['Close'])
 
-		# sort by volatility descending
-		# only the top 29 most volatile cryptos
-		self.volDict = sorted(self.volDict.items(), key = lambda x:x[1], reverse = True)[:29]
-		wire.write(str(self.volDict) + "\n\n")
+				# calculate percentage change in closing prices
+				df['Close_pct_change'] = df['Close'].pct_change() * 100
+				
+				# calculate normalized ATR by dividing by the close price and time difference
+				# only last three values will populate with data
+				df['Normalized_ATR'] = df['ATR'] / (df['Close'] * df['Date'].diff().dt.total_seconds())
+				
+				# remove first row
+				df = df.dropna(axis = 'rows')
+				
+				# average normalized atr
+				atr = df['Normalized_ATR'].mean()
+				
+				# average percentage change in closing prices
+				momentum = df['Close_pct_change'].mean()
+				
+				# combine metrics
+				combined_metric = (0.5 * atr) + (0.5 * momentum)
+				
+				self.output(str(name) + "\n" + str(df) + "\n\n")
+				
+				# add to dict
+				self.volDict[name] = combined_metric
+								
+			except Exception as e:
+				self.output(str(e) + "\n\n")	
+
+		# sort top thirty by volatility value descending
+		self.volDict = sorted(self.volDict.items(), key = lambda x:x[1], reverse = True)[:30]
 		
-		# return list of keys
+		self.output(str(self.volDict) + "\n\n")
+		
+		# return list of keys only
 		vList = []
 		for key, value in self.volDict:
 			vList.append(key)
@@ -222,10 +240,11 @@ class trade:
 	
 	# more reliable data via coinmarketcap
 	# requires >= hobbyist tier
-	def getHistorical(self, wire, num):
+	def getHistorical(self, num):
 		
-		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 129, convert='USD')
+		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 69, convert='USD')
 
+		# parse text
 		response = str(response)
 		response = response.replace(response[:31], "")
 		response = response[:-1]
@@ -253,6 +272,7 @@ class trade:
 			res = dict(res)
 			dictList.append(res)
 
+		# send to dataframe
 		df = pd.DataFrame(dictList)
 		
 		# remove columns with static values
@@ -300,52 +320,121 @@ class trade:
 		
 		# change to datetime
 		df["ds"] = pd.to_datetime(df["ds"])
-		
-		# wire.write(str(df) + "\n\n")
 
 		return df
 		
 		
-	def predict(self, wire, df, name):
-
-		# last timestamp
-		last_observed_time = df['ds'].max()
-
-		# one hour from the last timestamp
-		future_time = last_observed_time + timedelta(hours = 1)
-
-		# create dataframe with the future timestamp
-		future_date = pd.DataFrame({'ds': [future_time]})
-
-		features = ["rsi", "fastk", "fastd", "ema", "obv", "std", "macd", "macdsignal", "macdhist", "upperband", "middleband", "lowerband", "price", "volume_24h", 'percent_change_24h', 'percent_change_7d', 'percent_change_30d']
+	# five minute future price prediction
+	# arima and prophet algos
+	def predict(self, df, name):
 		
-		# fill in the regressor values for the future timestamp
-		for f in features:
-			future_date[f] = df[f].iloc[-1]		
-		
-		# arima
-		model = auto_arima(df["y"], exogenous = df[features], trace = True, error_action = "ignore", suppress_warnings = True)
-		aforecast = model.predict(n_periods = 12,  exogenous = df[features])
-		ar = float(aforecast.iloc[-1])
-		
-		# prophet
-		pmodel = Prophet(yearly_seasonality = False, weekly_seasonality = False, daily_seasonality = False)
-		pmodel.add_seasonality(name = "hourly", period = (1/24), fourier_order = 7)
-		
-		for f in features:
-			pmodel.add_regressor(f)
+		try:
+			# last timestamp
+			last_observed_time = df['ds'].max()
 
-		pmodel.fit(df[["ds", "y"] + features])
-		pforecast = pmodel.predict(future_date)
-		pr = float(pforecast['yhat'].iloc[0])
+			# 5 minutes the last timestamp
+			future_time = last_observed_time + timedelta(hours = 0.0833)
+
+			# create dataframe with the future timestamp
+			future_date = pd.DataFrame({'ds': [future_time]})
+
+			# same for both algos
+			features = ["rsi", "fastk", "fastd", "ema", "obv", "std", "macd", "macdsignal", "macdhist", "upperband", "middleband", "lowerband", "price", "volume_24h", 'percent_change_24h', 'percent_change_7d', 'percent_change_30d']
+
+			# fill in the regressor values for the future timestamp
+			for f in features:
+				future_date[f] = df[f].iloc[-1]		
+
+			# arima forecast
+			model = auto_arima(df["y"], exogenous = df[features], trace = True, error_action = "ignore", suppress_warnings = True)
+			aforecast = model.predict(n_periods = 1,  exogenous = df[features])
+			ar = float(aforecast.iloc[-1])
+
+			# configure prophet
+			pmodel = Prophet(yearly_seasonality = False, weekly_seasonality = False, daily_seasonality = False)
+			pmodel.add_seasonality(name = "hourly", period = (1/24), fourier_order = 7)
+			
+			# add features to prophet model
+			for f in features:
+				pmodel.add_regressor(f)
+			
+			# prophet forecast
+			pmodel.fit(df[["ds", "y"] + features])
+			pforecast = pmodel.predict(future_date)
+			pr = float(pforecast['yhat'].iloc[0])
+
+			# average two models
+			ar = ar * 0.5
+			pr = pr * 0.5
+			combine = ar + pr
+
+			self.output(name + "\nprice   -> " + str(df['price'].iloc[-1]) + "\nprophet -> " + str(pforecast['yhat'].iloc[0]) + "\narima   -> " + str(aforecast.iloc[-1]) + "\n\n")
+
+			# rule out negative predictions
+			# and cases where algos wildly disagree, ie arima -5.2 and prophet 11.5
+			if ar > 0 and pr > 0:
+
+				self.pred1hr[name] = combine
 		
-		# average two models
-		combine = (ar + pr) / 2
+		except Exception as e:
+			self.output(str(e) + "\n\n")
+			
+	
+	# usually one to two minute runtime
+	# twelve minute trade window
+	def trackMovement(self, name):
+		
+		# trade performance file
+		# reset after code modification
+		wire = open("./result.dat", "a")
+		
+		try:
+			
+			# most recent coinbase price
+			# temporary value for the trade price
+			name = name.replace(" Wallet", "-USD")
+			quote = self.cbp.get_product_ticker(product_id = name)
+			
+			# in case of delisted choice
+			self.output(str(quote) + "\n\n")
+			
+			lastPrice = float(quote['price'])
+			
+			breakOut = False
+			
+			# check price movement for twelve minutes
+			for i in range(12):
+
+				# pause for one minute
+				time.sleep(60)
 				
-		wire.write(name + "\nprice -> " + str(df['price'].iloc[-1]) + "\nprophet -> " + str(pforecast['yhat'].iloc[0]) + "\narima -> " + str(aforecast.iloc[-1]) + "\n\n")
-		self.pred1hr[name] = combine
-		
+				# calculate % change
+				quote1 = self.cbp.get_product_ticker(product_id = name)
+				newPrice = float(quote1['price'])
+				percentChange = ((newPrice - lastPrice) / lastPrice) * 100
+								
+				self.output(str(i + 1) + "\n")
+				self.output(str(newPrice) + " -> " + str(percentChange) + "\n")
+														
+				# gain				
+				if percentChange > 0.49 and i < 11 and breakOut == False:
+					self.output("SELL\n\n")
+					wire.write(str(percentChange) + ",")
+					breakOut = True
+					
+				# still need to figure out decrease logic
+				
+				# end of count
+				elif i == 11 and breakOut == False:
+					self.output("SELL\n\n")
+					wire.write(str(percentChange) + ",")
+						
+		except Exception as e:
+			self.output(str(e) + "\n\n")
 
+		wire.close()
+
+		
 def run():
 	_new = trade()
 
