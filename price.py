@@ -7,7 +7,8 @@ collections.Sequence = abc.Sequence
 collections.Callable = abc.Callable
 
 # imports
-from coinbase.wallet.client import Client
+from coinbase.wallet.client import Client as cbc
+from binance import Client as bnc
 import cbpro
 import coinmarketcapapi
 import pandas as pd
@@ -21,24 +22,34 @@ import time
 from datetime import datetime, timedelta
 import csv
 import re
-import logging
-
-# no prophet console output
-logging.getLogger("prophet").disabled = True
-logging.getLogger("cmdstanpy").disabled = True
 
 # pandas output config
 pd.set_option('display.max_rows', 25)
 pd.set_option('display.max_columns', 25)
+
+# global variable
+# 	prevents making the same trade
+#	twice in a row
+lastTrade = "First Run"
 
 
 class trade:
 
 	# api connections
 	handshake = open('/home/evan/Documents/hourlyTrade/api.dat', 'r').read().splitlines()
-	client = Client(handshake[0], handshake[1])
+	
+	# for coinbase account trades
+	client = cbc(handshake[0], handshake[1])
+	
+	# for binance public data
+	# bn_client = bnc(handshake[2], handshake[3], tld = "us")
+	
+	# for coinmarketcap data
+	# requires hobbyist tier
+	cmc = coinmarketcapapi.CoinMarketCapAPI(handshake[4])
+	
+	# for coinbase public data
 	cbp = cbpro.PublicClient()
-	cmc = coinmarketcapapi.CoinMarketCapAPI(handshake[2])
 	
 	# set up output
 	now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -48,11 +59,11 @@ class trade:
 	wire.write("##  BEGIN SCRIPT  ##\n")
 	wire.write("####################\n\n")
 	wire.close()
-	
-	
+		
 	# class variables
 	include = []
 	exclude = []
+	
 	cmcID   = {}	# name : cmcID and reverse
 	idCMC   = {}
 	assetID = {}	# name : cbAssetID
@@ -66,8 +77,8 @@ class trade:
 						
 		start_time = time.time()	# track runtime
 		
-		self.output("Initializer\n\n")
-		
+		global lastTrade
+				
 		self.readFromFile()
 		
 		allCryptos = self.checkForNew()
@@ -84,23 +95,43 @@ class trade:
 		
 			self.predict(df, name)
 		
-		self.pred1hr = sorted(self.pred1hr.items(), key = lambda x:x[1], reverse = True)[:1]
-		self.output("\nCombined Final Prediction -> " + str(self.pred1hr) + "\n\n")
+		self.pred1hr = sorted(self.pred1hr.items(), key = lambda x:x[1], reverse = True)[:2]
+		
+		self.output("Top 2 -> " + str(self.pred1hr) + "\n\n")
+		
+		# don't do the same trade twice
+		self.output("lastTrade -> " + lastTrade + "\n\n")
+		self.output(str(next(iter(self.pred1hr[0]))) + "\n\n")
+		
+		if lastTrade == str(next(iter(self.pred1hr[0]))):
+			self.output("MATCH\n\n")
+			self.pred1hr.pop(0)
+		else:
+			self.output("NOT MATCH\n\n")
+			self.pred1hr.pop(1)
+		
+		# check price of last trade before new pick output
+		# track price movement after sell
+		if lastTrade != "First Run":
+
+			name = lastTrade.replace(" Wallet", "-USD")
+			self.output("Last Trade Price ->\n")
+			quote = self.cbp.get_product_ticker(product_id = name)
+			
+			# in case of delisted choice
+			self.output(str(quote) + "\n\n")
+		
+		self.output("\nCombined Final Prediction -> " + str(self.pred1hr[0]) + "\n\n")
 		
 		end_time = time.time()
 		
-		self.output("Runtime ->\n")
+		self.output("\nRuntime ->\n")
 		self.output(str(end_time - start_time) + " seconds\n")
 		self.output(str((end_time - start_time) / 60) + " minutes\n\n")
 		
-		keyList = []
-		for key, value in self.pred1hr:
-			keyList.append(key)
-			self.output(str(key) + "\n")
+		lastTrade = str(next(iter(self.pred1hr[0])))
 		
-		self.output(str(keyList) + "\n\n")
-		
-		self.trackMovement(keyList[0])
+		self.trackMovement(lastTrade)
 		
 	
 	# streamline output file
@@ -114,7 +145,7 @@ class trade:
 	def readFromFile(self):
 
 		# available cryptos
-		with open("/home/evan/Documents/hourlyTrade/include.dat", mode = "r") as infile:
+		with open("/home/evan/Documents/hourlyTrade/cbInclude.dat", mode = "r") as infile:
 			reader = csv.reader(infile)
 			for row in reader:	
 				self.include.append(row[0])
@@ -122,7 +153,7 @@ class trade:
 				self.idCMC[row[1]] = row[0]
 		
 		# unavailable cryptos
-		with open("/home/evan/Documents/hourlyTrade/exclude.dat", mode = "r") as infile:
+		with open("/home/evan/Documents/hourlyTrade/cbExclude.dat", mode = "r") as infile:
 			for line in infile:
 				self.exclude.append(line.strip())
 
@@ -155,7 +186,7 @@ class trade:
 		
 		# sometimes get_accounts will error out
 		try:
-			account = self.client.get_accounts(limit = 300)		# 264 as of 12/13/23
+			account = self.client.get_accounts(limit = 300)
 			for wallet in account.data:
 
 				if wallet['name'] in self.include:
@@ -191,9 +222,6 @@ class trade:
 				
 				# convert date from unix timestamp to readable format
 				df['Date'] = pd.to_datetime(df['Date'], unit='s')
-
-				# focus on very recent data
-				df = df.tail(16)
 				
 				# average true range volatility
 				df['ATR'] = average_true_range(df['High'], df['Low'], df['Close'])
@@ -205,17 +233,30 @@ class trade:
 				# only last three values will populate with data
 				df['Normalized_ATR'] = df['ATR'] / (df['Close'] * df['Date'].diff().dt.total_seconds())
 				
-				# remove first row
+				# calculate logarithmic returns
+				df['Log_Ret'] = np.log(df['High'] / df['Low'])
+				
+				# remove NA rows
 				df = df.dropna(axis = 'rows')
+				
+				# all df rows for volatility
+				# calculate historical volatility without a rolling window
+				vol = df['Log_Ret'].std() * np.sqrt(len(df))
+				
+				# 80 "minutes" for atr
+				df = df.tail(80)
 				
 				# average normalized atr
 				atr = df['Normalized_ATR'].mean()
+				
+				# tiny positive momentum
+				df = df.tail(4)
 				
 				# average percentage change in closing prices
 				momentum = df['Close_pct_change'].mean()
 				
 				# combine metrics
-				combined_metric = (0.5 * atr) + (0.5 * momentum)
+				combined_metric = (0.33 * vol) + (0.33 * atr) + (0.33 * momentum)
 				
 				self.output(str(name) + "\n" + str(df) + "\n\n")
 				
@@ -225,6 +266,9 @@ class trade:
 			except Exception as e:
 				self.output(str(e) + "\n\n")	
 
+		self.output("Vol ->\n")
+		self.output(str(self.volDict) + "\n\n")
+		
 		# sort top thirty by volatility value descending
 		self.volDict = sorted(self.volDict.items(), key = lambda x:x[1], reverse = True)[:30]
 		
@@ -242,7 +286,7 @@ class trade:
 	# requires >= hobbyist tier
 	def getHistorical(self, num):
 		
-		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 69, convert='USD')
+		response = self.cmc.cryptocurrency_quotes_historical(id = num, count = 81, convert='USD')
 
 		# parse text
 		response = str(response)
@@ -320,73 +364,40 @@ class trade:
 		
 		# change to datetime
 		df["ds"] = pd.to_datetime(df["ds"])
+		
+		self.output(str(self.idCMC[num]) + "\n")
+		self.output(str(df) + "\n\n")
 
 		return df
 		
 		
 	# five minute future price prediction
-	# arima and prophet algos
+	# arima algo
 	def predict(self, df, name):
 		
 		try:
-			# last timestamp
-			last_observed_time = df['ds'].max()
-
-			# 5 minutes the last timestamp
-			future_time = last_observed_time + timedelta(hours = 0.0833)
-
-			# create dataframe with the future timestamp
-			future_date = pd.DataFrame({'ds': [future_time]})
-
-			# same for both algos
+			
 			features = ["rsi", "fastk", "fastd", "ema", "obv", "std", "macd", "macdsignal", "macdhist", "upperband", "middleband", "lowerband", "price", "volume_24h", 'percent_change_24h', 'percent_change_7d', 'percent_change_30d']
-
-			# fill in the regressor values for the future timestamp
-			for f in features:
-				future_date[f] = df[f].iloc[-1]		
 
 			# arima forecast
 			model = auto_arima(df["y"], exogenous = df[features], trace = True, error_action = "ignore", suppress_warnings = True)
 			aforecast = model.predict(n_periods = 1,  exogenous = df[features])
 			ar = float(aforecast.iloc[-1])
 
-			# configure prophet
-			pmodel = Prophet(yearly_seasonality = False, weekly_seasonality = False, daily_seasonality = False)
-			pmodel.add_seasonality(name = "hourly", period = (1/24), fourier_order = 7)
-			
-			# add features to prophet model
-			for f in features:
-				pmodel.add_regressor(f)
-			
-			# prophet forecast
-			pmodel.fit(df[["ds", "y"] + features])
-			pforecast = pmodel.predict(future_date)
-			pr = float(pforecast['yhat'].iloc[0])
+			self.output(name + "\nprice   -> " + str(df['price'].iloc[-1]) + "\narima   -> " + str(ar) + "\n\n")
 
-			# average two models
-			ar = ar * 0.5
-			pr = pr * 0.5
-			combine = ar + pr
-
-			self.output(name + "\nprice   -> " + str(df['price'].iloc[-1]) + "\nprophet -> " + str(pforecast['yhat'].iloc[0]) + "\narima   -> " + str(aforecast.iloc[-1]) + "\n\n")
-
-			# rule out negative predictions
-			# and cases where algos wildly disagree, ie arima -5.2 and prophet 11.5
-			if ar > 0 and pr > 0:
-
-				self.pred1hr[name] = combine
+			self.pred1hr[name] = ar
 		
 		except Exception as e:
 			self.output(str(e) + "\n\n")
 			
 	
-	# usually one to two minute runtime
-	# twelve minute trade window
+	# update price every fifteen seconds
 	def trackMovement(self, name):
 		
 		# trade performance file
 		# reset after code modification
-		wire = open("./result.dat", "a")
+		wire = open("/home/evan/Documents/hourlyTrade/result.dat", "a")
 		
 		try:
 			
@@ -400,39 +411,41 @@ class trade:
 			
 			lastPrice = float(quote['price'])
 			
-			breakOut = False
+			# counter
+			i = 0
 			
-			# check price movement for twelve minutes
-			for i in range(12):
+			# check price movement
+			while True:
 
-				# pause for one minute
-				time.sleep(60)
+				# pause for fifteen seconds
+				time.sleep(15)
+				
+				# one quarter of a minute increment
+				i += 0.25
 				
 				# calculate % change
 				quote1 = self.cbp.get_product_ticker(product_id = name)
 				newPrice = float(quote1['price'])
 				percentChange = ((newPrice - lastPrice) / lastPrice) * 100
 								
-				self.output(str(i + 1) + "\n")
+				self.output(str(i) + "\n")
 				self.output(str(newPrice) + " -> " + str(percentChange) + "\n")
 														
 				# gain				
-				if percentChange > 0.49 and i < 11 and breakOut == False:
+				if percentChange > 1.5:
 					self.output("SELL\n\n")
 					wire.write(str(percentChange) + ",")
-					breakOut = True
+					wire.close()
 					
+					# break circular reference by setting reference to None
+					self._new_trade_instance = None
+					self._new_trade_instance = trade()
+		
 				# still need to figure out decrease logic
-				
-				# end of count
-				elif i == 11 and breakOut == False:
-					self.output("SELL\n\n")
-					wire.write(str(percentChange) + ",")
-						
+				# or maybe just not...
+					
 		except Exception as e:
 			self.output(str(e) + "\n\n")
-
-		wire.close()
 
 		
 def run():
@@ -444,3 +457,108 @@ def run():
 ##############
 
 run()
+
+
+# this prints out a ton of info, including the base_id of
+# each crypto to make the trades work
+# base_id goes into source_asset and target_asset as shown below
+# in next chunk of code
+#
+# prices = client._get("v2", "assets", "prices", params={
+#    "base": "USD",
+#	 "filter": "holdable",
+#	 "resolution": "latest"
+# })
+# print(f"Status Code: {prices.status_code}")
+# print(f'Response Body: {prices.content.decode("utf8")}')
+
+
+# this converts $5 of one crypto to another
+# requires base_id for each
+# works with no output for now, updates online quick, ~30 seconds
+#
+# r = client._post('v2', "trades", data={
+#    "amount":"5.00",
+#    "amount_asset":"USD",
+#    "amount_from":"input",
+#    "source_asset":"",
+#    "target_asset":""
+#    }
+# )
+# result = r.json()
+# trade_id = result['data']['id']
+# client._post("v2", "trades", trade_id, "commit")
+
+
+
+	#######################
+	## binance functions ##
+	#######################
+	
+	# potentially could use
+	
+	# input files
+	# def binInput(self):
+
+		# available cryptos
+		# with open("/home/evan/Documents/hourlyTrade/cbInclude.dat", mode = "r") as infile:
+			# reader = csv.reader(infile)
+			# for row in reader:	
+				# self.include.append(row[0])
+				# self.cmcID[row[0]] = row[1]
+				# self.idCMC[row[1]] = row[0]
+		
+		# unavailable cryptos
+		# with open("/home/evan/Documents/hourlyTrade/cbExclude.dat", mode = "r") as infile:
+			# for line in infile:
+				# self.exclude.append(line.strip())
+	
+	
+	# available binance cryptos
+	# def binCryptos(self):
+		
+		# try:
+			# get account information
+			# account_info = self.client.get_account()
+
+			# self.output("Available ->\n")	
+
+			#for crypto in account_info['balances']:
+				# self.output(str(crypto['asset']) + "\n")
+
+
+			# Get all exchange info
+			# exchange_info = self.client.get_exchange_info()
+
+			# Extract available cryptocurrencies (assets)
+			# available_cryptos = [symbol['baseAsset'] for symbol in exchange_info['symbols']]
+
+			# Remove duplicates and sort
+			# available_cryptos = sorted(set(available_cryptos))
+
+			# Print the list of available cryptocurrencies
+			# self.output("Available cryptocurrencies:\n")
+
+			# for crypto in available_cryptos:
+				
+				# try:
+					
+					# self.output(str(crypto) + "\n")
+
+					# Make the API request using the python-binance library
+					# klines = self.client.get_klines(symbol = str(crypto) + "USDT", interval = "1m", limit = 120)
+
+					# Convert the data to a Pandas DataFrame
+					# df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+
+					# Convert timestamp to datetime format
+					# df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+					# Display the DataFrame
+					# self.output(str(df) + "\n\n")
+				
+				# except Exception as e:
+					# self.output(str(e) + "\n\n")		
+		
+		# except Exception as e:
+			# self.output(str(e) + "\n\n")	
